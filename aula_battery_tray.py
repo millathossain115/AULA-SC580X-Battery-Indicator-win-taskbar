@@ -1,7 +1,7 @@
 """
-AULA SC580X Battery Monitor for Windows System Tray (Windows Native Edition)
-Clean, Sharp, Natural-Weight Segoe UI Typography with Bottom Gauge Bar,
-Type-C Wired Charging Detection, and Single-Instance Protection.
+AULA SC580X Battery Monitor for Windows System Tray (Native Resolution High-Luminance Edition)
+Pure Solid High-Intensity White Typography with Native 1:1 Tray Pixel Alignment,
+Bottom Monochromatic Level Bar, Type-C Wired Charging Detection, and Single-Instance Mutex.
 Chipset: CompX (PixArt PAW3311), Wireless VID: 0x3554, PID: 0xFA09 | Wired VID: 0x088D, PID: 0x062E
 """
 
@@ -26,7 +26,14 @@ OPEN_EXISTING = 3
 ERROR_ALREADY_EXISTS = 183
 
 kernel32 = ctypes.windll.kernel32
+user32 = ctypes.windll.user32
 hid_dll = ctypes.windll.hid
+
+# Enable High-DPI Awareness so Windows gives true pixel coordinates
+try:
+    user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 APP_NAME = "AULA SC580X Battery Tray"
 MUTEX_NAME = r"Global\AULA_SC580X_Battery_Monitor_Mutex"
@@ -68,25 +75,17 @@ class MouseBatteryMonitor:
         self.running = True
         self.icon = None
 
-    def _get_fitted_font(self, text, max_w, max_h):
-        """Fit clean, natural-weight Segoe UI typography to maximize size without chunkiness"""
-        font_candidates = [
-            "C:/Windows/Fonts/segoeui.ttf",
-            "segoeui.ttf",
-            "arial.ttf"
-        ]
-        for sz in range(130, 35, -1):
-            for fp in font_candidates:
-                try:
-                    font = ImageFont.truetype(fp, sz)
-                    bbox = font.getbbox(text)
-                    w = bbox[2] - bbox[0]
-                    h = bbox[3] - bbox[1]
-                    if w <= max_w and h <= max_h:
-                        return font, sz, bbox
-                except Exception:
-                    continue
-        return ImageFont.load_default(), 40, (0, 0, 10, 10)
+        # Determine user's exact Windows system tray icon resolution
+        self.tray_size = self._get_native_tray_size()
+
+    def _get_native_tray_size(self):
+        try:
+            sz = user32.GetSystemMetrics(49)  # SM_CXSMICON
+            if 16 <= sz <= 64:
+                return sz
+        except Exception:
+            pass
+        return 20  # Default for 125% DPI displays
 
     def read_battery_hid(self):
         """Query the AULA mouse via HID Feature Report ID 6 and detect Type-C wired connection"""
@@ -151,79 +150,78 @@ class MouseBatteryMonitor:
 
     def generate_crisp_icon(self, percentage, connected, is_charging=False):
         """
-        Render clean, high-visibility monochromatic icon:
-        - Large, clean-weight Segoe UI numbers on top (sharp, natural proportions)
-        - Sleek monochromatic battery gauge bar across the bottom
-        - Crisp lightning bolt charging indicator when wired
+        Generate pixel-perfect native resolution icon matching user's exact Windows tray DPI:
+        - Pure solid 100% intense white (#FFFFFF) with zero color bleeding/fading
+        - Maximized Segoe UI Bold typography filling the space above the gauge bar
+        - Monochromatic gauge bar at the bottom
+        - Crisp lightning bolt when charging
         """
-        size = 128
-        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        # Render on 2x retina buffer for clean integer downsampling
+        buf_size = self.tray_size * 2
+        img = Image.new('RGBA', (buf_size, buf_size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        # 1. Monochromatic gauge bar at the bottom
-        bar_x1, bar_y1, bar_x2, bar_y2 = 4, 112, 124, 124
-        bar_w = bar_x2 - bar_x1
-
-        # Track background
-        draw.rounded_rectangle([bar_x1, bar_y1, bar_x2, bar_y2], radius=4, fill=(45, 48, 55, 230), outline=(75, 80, 90, 255), width=1)
+        # 1. Monochromatic slim gauge bar at bottom
+        bar_h = max(3, int(buf_size * 0.10))
+        bar_y1 = buf_size - bar_h - 2
+        bar_y2 = buf_size - 2
+        draw.rounded_rectangle([1, bar_y1, buf_size - 2, bar_y2], radius=1, fill=(40, 44, 52, 230))
 
         if connected:
-            fill_w = max(8, int(bar_w * (percentage / 100.0)))
-            # Clean silver/white gauge fill
-            draw.rounded_rectangle([bar_x1, bar_y1, bar_x1 + fill_w, bar_y2], radius=4, fill=(245, 248, 255, 255))
+            fill_w = max(3, int((buf_size - 3) * (percentage / 100.0)))
+            # Pure solid high-intensity white
+            draw.rounded_rectangle([1, bar_y1, 1 + fill_w, bar_y2], radius=1, fill=(255, 255, 255, 255))
         else:
-            # Disconnected indicator in bar
-            draw.rounded_rectangle([bar_x1, bar_y1, bar_x1 + 14, bar_y2], radius=4, fill=(160, 60, 60, 255))
+            draw.rounded_rectangle([1, bar_y1, 6, bar_y2], radius=1, fill=(180, 60, 60, 255))
 
         # 2. Number on top
         text = "?" if not connected else str(percentage)
+        font_path = "C:/Windows/Fonts/segoeuib.ttf"
 
         if connected and is_charging:
             # Scaled number on left with sharp lightning bolt on right
-            max_w = 88
-            font, sz, b = self._get_fitted_font(text, max_w, 100)
-            x_num = 44
-            y_num = 52
+            fsize = int(buf_size * 0.50) if len(text) == 3 else int(buf_size * 0.70)
+            try:
+                font = ImageFont.truetype(font_path, fsize)
+            except Exception:
+                font = ImageFont.load_default()
 
-            # Clean 1px outline for razor-sharp edge contrast
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx != 0 or dy != 0:
-                        draw.text((x_num + dx, y_num + dy), text, font=font, fill=(0, 0, 0, 230), anchor="mm")
+            x_num = int(buf_size * 0.35)
+            y_num = (bar_y1) // 2
+
+            # Pure 100% solid white
             draw.text((x_num, y_num), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
 
-            # Sleek lightning bolt
-            bx = 106
-            by = 14
+            # Lightning bolt (sharp solid white)
+            bx = int(buf_size * 0.80)
+            by = 4
+            bolt_h = int(buf_size * 0.58)
             bolt_pts = [
-                (bx + 8,  by + 0),
-                (bx - 10, by + 36),
-                (bx - 1,  by + 36),
-                (bx - 12, by + 74),
-                (bx + 14, by + 28),
-                (bx + 2,  by + 28)
+                (bx + 3,  by + 0),
+                (bx - 4,  by + int(bolt_h * 0.44)),
+                (bx + 0,  by + int(bolt_h * 0.44)),
+                (bx - 4,  by + bolt_h),
+                (bx + 6,  by + int(bolt_h * 0.36)),
+                (bx + 1,  by + int(bolt_h * 0.36))
             ]
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx != 0 or dy != 0:
-                        draw.polygon([(px + dx, py + dy) for px, py in bolt_pts], fill=(0, 0, 0, 230))
             draw.polygon(bolt_pts, fill=(255, 255, 255, 255))
 
         else:
-            # Clean large number centered
-            max_w = 124
-            font, sz, b = self._get_fitted_font(text, max_w, 102)
-            x, y = size // 2, 52
+            # Full width number centered with maximum scale
+            fsize = int(buf_size * 0.58) if len(text) == 3 else int(buf_size * 0.78)
+            try:
+                font = ImageFont.truetype(font_path, fsize)
+            except Exception:
+                font = ImageFont.load_default()
 
-            # Clean 1px outline
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx != 0 or dy != 0:
-                        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 230), anchor="mm")
+            x = buf_size // 2
+            y = (bar_y1) // 2
+
             fill_col = (180, 185, 195, 255) if not connected else (255, 255, 255, 255)
             draw.text((x, y), text, font=font, fill=fill_col, anchor="mm")
 
-        return img.resize((64, 64), Image.Resampling.LANCZOS)
+        # Downsample cleanly to user's exact native tray icon size
+        return img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
 
     def send_notification(self, title, message):
         """Send native Windows toast notification"""
