@@ -1,6 +1,7 @@
 """
-AULA SC580X Battery Monitor for Windows System Tray (Windows Native Edition)
-High-Visibility Monochromatic Segoe UI Typography with Wired Type-C Charging Detection.
+AULA SC580X Battery Monitor for Windows System Tray (Windows Native Monochrome Edition)
+High-Visibility Monochromatic Segoe UI / Arial Black Typography with Bottom Gauge Bar
+and Type-C Wired Charging Detection.
 Single Instance protection via Win32 Named Mutex.
 Chipset: CompX (PixArt PAW3311), VID: 0x3554, PID: 0xFA09
 """
@@ -39,7 +40,6 @@ def ensure_single_instance():
     mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     last_error = kernel32.GetLastError()
     if last_error == ERROR_ALREADY_EXISTS:
-        # Another instance is already running
         try:
             from win11toast import toast
             toast(
@@ -63,18 +63,28 @@ class MouseBatteryMonitor:
         self.running = True
         self.icon = None
 
-    def _get_font(self, size):
-        for path in ["C:/Windows/Fonts/segoeuib.ttf", "segoeuib.ttf", "arialbd.ttf"]:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
+    def _get_fitted_font(self, text, max_w, max_h):
+        font_candidates = [
+            "C:/Windows/Fonts/ariblk.ttf",
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "arialbd.ttf"
+        ]
+        for sz in range(115, 35, -2):
+            for fp in font_candidates:
+                try:
+                    font = ImageFont.truetype(fp, sz)
+                    bbox = font.getbbox(text)
+                    w = bbox[2] - bbox[0]
+                    h = bbox[3] - bbox[1]
+                    if w <= max_w and h <= max_h:
+                        return font, sz, bbox
+                except Exception:
+                    continue
+        return ImageFont.load_default(), 40, (0, 0, 10, 10)
 
     def read_battery_hid(self):
         """Query the AULA mouse via HID Feature Report ID 6 on vendor usage page 0xFF04"""
         try:
-            # Check if mouse is wired directly via Type-C
             devices = hid.enumerate(0x3554)
             is_wired = any(
                 d.get('vendor_id') == 0x3554 and d.get('product_id') != 0xfa09
@@ -111,31 +121,40 @@ class MouseBatteryMonitor:
         return False, None, False
 
     def generate_crisp_icon(self, percentage, connected, is_charging=False):
-        """Render high-contrast monochromatic Segoe UI digits matching Windows 10/11 taskbar style"""
+        """
+        Render high-contrast monochromatic icon:
+        - Large, high-visibility bold numbers on top (maximizing available tile space)
+        - Sleek monochromatic battery gauge bar across the bottom
+        - Distinct lightning bolt charging indicator when wired
+        """
         size = 128
         img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        if not connected:
-            font = self._get_font(98)
-            text = "?"
-            x, y = size // 2, size // 2 - 2
-            # Dark outline
-            for dx in range(-3, 4):
-                for dy in range(-3, 4):
-                    if dx * dx + dy * dy <= 9:
-                        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255), anchor="mm")
-            draw.text((x, y), text, font=font, fill=(175, 180, 190, 255), anchor="mm")
-            return img.resize((64, 64), Image.Resampling.LANCZOS)
+        # 1. Monochromatic gauge bar at the bottom
+        bar_x1, bar_y1, bar_x2, bar_y2 = 4, 104, 124, 124
+        bar_w = bar_x2 - bar_x1
 
-        text = str(percentage)
+        # Track slot background (dark slate with border)
+        draw.rounded_rectangle([bar_x1, bar_y1, bar_x2, bar_y2], radius=6, fill=(45, 48, 55, 230), outline=(80, 85, 95, 255), width=1)
 
-        if is_charging:
+        if connected:
+            fill_w = max(10, int(bar_w * (percentage / 100.0)))
+            # Monochromatic bright silver/white gauge bar fill
+            draw.rounded_rectangle([bar_x1, bar_y1, bar_x1 + fill_w, bar_y2], radius=6, fill=(245, 248, 255, 255))
+        else:
+            # Subtle disconnected indicator in bar
+            draw.rounded_rectangle([bar_x1, bar_y1, bar_x1 + 14, bar_y2], radius=6, fill=(160, 60, 60, 255))
+
+        # 2. Number / Symbol on top
+        text = "?" if not connected else str(percentage)
+
+        if connected and is_charging:
             # Scaled number on left with sharp lightning bolt on right
-            fsize = 64 if len(text) == 3 else 86
-            font = self._get_font(fsize)
-            x_num = 44 if len(text) <= 2 else 38
-            y_num = size // 2 - 1
+            max_w = 88
+            font, sz, bbox = self._get_fitted_font(text, max_w, 92)
+            x_num = 44
+            y_num = 50
 
             # Outline
             for dx in range(-3, 4):
@@ -144,35 +163,35 @@ class MouseBatteryMonitor:
                         draw.text((x_num + dx, y_num + dy), text, font=font, fill=(0, 0, 0, 255), anchor="mm")
             draw.text((x_num, y_num), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
 
-            # Sleek modern lightning bolt
-            bx = 96 if len(text) <= 2 else 102
-            by = 22
+            # Modern lightning bolt
+            bx = 108
+            by = 8
             bolt_pts = [
-                (bx + 11, by + 0),
-                (bx - 14, by + 42),
-                (bx - 1,  by + 42),
-                (bx - 16, by + 86),
-                (bx + 19, by + 34),
-                (bx + 3,  by + 34)
+                (bx + 9,  by + 0),
+                (bx - 12, by + 40),
+                (bx - 1,  by + 40),
+                (bx - 14, by + 82),
+                (bx + 16, by + 32),
+                (bx + 2,  by + 32)
             ]
             for dx in range(-3, 4):
                 for dy in range(-3, 4):
                     if dx * dx + dy * dy <= 9:
-                        shifted = [(px + dx, py + dy) for px, py in bolt_pts]
-                        draw.polygon(shifted, fill=(0, 0, 0, 255))
+                        draw.polygon([(px + dx, py + dy) for px, py in bolt_pts], fill=(0, 0, 0, 255))
             draw.polygon(bolt_pts, fill=(255, 255, 255, 255))
 
         else:
-            # Monochromatic large number centered
-            fsize = 72 if len(text) == 3 else 102
-            font = self._get_font(fsize)
-            x, y = size // 2, size // 2 - 2
+            # Full width number centered
+            max_w = 122
+            font, sz, bbox = self._get_fitted_font(text, max_w, 92)
+            x, y = size // 2, 50
 
             for dx in range(-3, 4):
                 for dy in range(-3, 4):
                     if dx * dx + dy * dy <= 9:
                         draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255), anchor="mm")
-            draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
+            fill_col = (180, 185, 195, 255) if not connected else (255, 255, 255, 255)
+            draw.text((x, y), text, font=font, fill=fill_col, anchor="mm")
 
         return img.resize((64, 64), Image.Resampling.LANCZOS)
 

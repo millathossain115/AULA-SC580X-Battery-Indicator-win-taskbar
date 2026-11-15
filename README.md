@@ -59,8 +59,9 @@ Quick actions available directly from the system tray:
 
 ## ✨ Key Features
 
-- **Monochromatic Windows Design:** Replaces distracting colored bars with razor-sharp, monochromatic typography styled specifically for Windows 10 and Windows 11.
-- **Large & Noticeable Digits:** Rendered at double-resolution ($128 \times 128$) with a 3-pixel contrast stroke and downscaled using **Lanczos** interpolation for crystal-clear readability even on 4K High-DPI screens.
+- **Monochromatic Windows Design:** Clean, stylish monochromatic styling matching Windows 10/11 taskbar themes.
+- **Maximized & Noticeable Digits:** Dynamically scales typography (up to 110pt font) to fill the entire upper tile above the gauge bar with a 3-pixel radial contrast outline for maximum visibility on High-DPI screens.
+- **Monochromatic Battery Gauge Bar:** Retains the glanceable bottom battery level bar rendered in high-contrast dark-slate and bright silver/white, scaling smoothly with remaining battery percentage.
 - **Type-C Wired & Charging Detection:** Automatically senses when the mouse is connected via USB Type-C cable, displaying an active lightning bolt badge (`⚡`) and updating status to *Charging*.
 - **Low-Battery Toast Notifications:** Sends a native Windows 10/11 banner alert when battery drops to **20% or below** so you never get interrupted.
 - **Sleep & Disconnect Awareness:** Gracefully displays `?` when the mouse enters power-saving sleep or the dongle is removed.
