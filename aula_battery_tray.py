@@ -1,9 +1,8 @@
 """
 AULA SC580X Battery Monitor for Windows System Tray (Windows Native Monochrome Edition)
-High-Visibility Monochromatic Segoe UI / Arial Black Typography with Bottom Gauge Bar
-and Type-C Wired Charging Detection.
-Single Instance protection via Win32 Named Mutex.
-Chipset: CompX (PixArt PAW3311), VID: 0x3554, PID: 0xFA09
+High-Visibility Monochromatic Typography with Bottom Gauge Bar,
+Type-C Wired Charging Detection, and Single-Instance Protection.
+Chipset: CompX (PixArt PAW3311), Wireless VID: 0x3554, PID: 0xFA09 | Wired VID: 0x088D, PID: 0x062E
 """
 
 import os
@@ -34,6 +33,12 @@ MUTEX_NAME = r"Global\AULA_SC580X_Battery_Monitor_Mutex"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "AULASc580xBatteryTray"
 
+# Hardware IDs for AULA SC580X
+WIRELESS_VID = 0x3554
+WIRELESS_PID = 0xFA09
+WIRED_VID = 0x088D
+WIRED_PID = 0x062E
+
 
 def ensure_single_instance():
     """Ensure only one instance runs at a time using a Win32 Named Mutex."""
@@ -59,12 +64,14 @@ class MouseBatteryMonitor:
         self.is_connected = False
         self.is_charging = False
         self.low_battery_warned = False
-        self.poll_interval = 60  # seconds
+        self.poll_interval = 4  # Fast 4-second poll for instant cable plug/unplug reaction
         self.running = True
         self.icon = None
 
     def _get_fitted_font(self, text, max_w, max_h):
         font_candidates = [
+            "C:/Windows/Fonts/impact.ttf",
+            "C:/Windows/Fonts/bahnschrift.ttf",
             "C:/Windows/Fonts/ariblk.ttf",
             "C:/Windows/Fonts/segoeuib.ttf",
             "arialbd.ttf"
@@ -83,17 +90,27 @@ class MouseBatteryMonitor:
         return ImageFont.load_default(), 40, (0, 0, 10, 10)
 
     def read_battery_hid(self):
-        """Query the AULA mouse via HID Feature Report ID 6 on vendor usage page 0xFF04"""
+        """Query the AULA mouse via HID Feature Report ID 6 and detect Type-C wired connection"""
         try:
-            devices = hid.enumerate(0x3554)
+            all_devices = hid.enumerate()
+
+            # 1. Check if mouse is wired directly via Type-C cable
             is_wired = any(
-                d.get('vendor_id') == 0x3554 and d.get('product_id') != 0xfa09
-                for d in devices
+                (d.get('vendor_id') == WIRED_VID and d.get('product_id') == WIRED_PID) or
+                (d.get('vendor_id') == WIRELESS_VID and d.get('product_id') != WIRELESS_PID) or
+                (d.get('vendor_id') in [WIRED_VID, WIRELESS_VID] and
+                 'mouse' in str(d.get('product_string', '')).lower() and
+                 'receiver' not in str(d.get('product_string', '')).lower())
+                for d in all_devices
             )
 
-            for d in devices:
-                up = d.get('usage_page', 0)
-                if up == 0xff04 or (up >= 0xff00 and d.get('usage') == 2):
+            # 2. Query battery percentage via wireless receiver (Feature Report 6 on 0xFF04)
+            pct = None
+            found_wireless = False
+            charging_from_report = False
+
+            for d in all_devices:
+                if d.get('vendor_id') == WIRELESS_VID and d.get('usage_page') == 0xff04:
                     path = d['path'].decode('utf-8') if isinstance(d['path'], bytes) else d['path']
                     hDev = kernel32.CreateFileW(
                         path,
@@ -111,31 +128,45 @@ class MouseBatteryMonitor:
                         kernel32.CloseHandle(hDev)
                         if success:
                             data = list(buf)
-                            pct = data[3]
-                            if 0 <= pct <= 100:
-                                # Mode byte: 1 = wired/charging, 2 = 2.4G wireless
-                                charging = is_wired or (data[1] == 1) or (data[2] == 1)
-                                return True, pct, charging
-        except Exception:
-            pass
-        return False, None, False
+                            if 0 <= data[3] <= 100:
+                                pct = data[3]
+                                found_wireless = True
+                                # CompX charging indicator flag
+                                if data[1] == 1 or data[2] == 1:
+                                    charging_from_report = True
+                    break
+
+            is_connected = found_wireless or is_wired
+            if not is_connected:
+                return False, None, False
+
+            # If wired cable is connected, percentage is 100% (or current read) and charging is TRUE
+            if is_wired:
+                if pct is None:
+                    pct = self.battery_pct if self.battery_pct else 100
+                return True, pct, True
+
+            return True, pct, charging_from_report
+
+        except Exception as e:
+            return False, None, False
 
     def generate_crisp_icon(self, percentage, connected, is_charging=False):
         """
         Render high-contrast monochromatic icon:
         - Large, high-visibility bold numbers on top (maximizing available tile space)
         - Sleek monochromatic battery gauge bar across the bottom
-        - Distinct lightning bolt charging indicator when wired
+        - Distinct lightning bolt charging indicator when wired / charging
         """
         size = 128
         img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # 1. Monochromatic gauge bar at the bottom
-        bar_x1, bar_y1, bar_x2, bar_y2 = 4, 104, 124, 124
+        bar_x1, bar_y1, bar_x2, bar_y2 = 4, 108, 124, 124
         bar_w = bar_x2 - bar_x1
 
-        # Track slot background (dark slate with border)
+        # Track slot background (dark slate with subtle border)
         draw.rounded_rectangle([bar_x1, bar_y1, bar_x2, bar_y2], radius=6, fill=(45, 48, 55, 230), outline=(80, 85, 95, 255), width=1)
 
         if connected:
@@ -152,20 +183,20 @@ class MouseBatteryMonitor:
         if connected and is_charging:
             # Scaled number on left with sharp lightning bolt on right
             max_w = 88
-            font, sz, bbox = self._get_fitted_font(text, max_w, 92)
+            font, sz, bbox = self._get_fitted_font(text, max_w, 94)
             x_num = 44
-            y_num = 50
+            y_num = 52
 
-            # Outline
+            # Stroke
             for dx in range(-3, 4):
                 for dy in range(-3, 4):
                     if dx * dx + dy * dy <= 9:
                         draw.text((x_num + dx, y_num + dy), text, font=font, fill=(0, 0, 0, 255), anchor="mm")
             draw.text((x_num, y_num), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
 
-            # Modern lightning bolt
-            bx = 108
-            by = 8
+            # Sleek lightning bolt
+            bx = 106
+            by = 10
             bolt_pts = [
                 (bx + 9,  by + 0),
                 (bx - 12, by + 40),
@@ -182,9 +213,9 @@ class MouseBatteryMonitor:
 
         else:
             # Full width number centered
-            max_w = 122
-            font, sz, bbox = self._get_fitted_font(text, max_w, 92)
-            x, y = size // 2, 50
+            max_w = 124
+            font, sz, bbox = self._get_fitted_font(text, max_w, 96)
+            x, y = size // 2, 52
 
             for dx in range(-3, 4):
                 for dy in range(-3, 4):
@@ -233,7 +264,7 @@ class MouseBatteryMonitor:
         if not self.is_connected:
             return "AULA SC580X: Disconnected"
         if self.is_charging:
-            return f"AULA SC580X: {self.battery_pct}% ⚡ (Charging)"
+            return f"AULA SC580X: {self.battery_pct}% ⚡ (Charging / Wired)"
         return f"AULA SC580X: {self.battery_pct}%"
 
     def _update_ui(self):

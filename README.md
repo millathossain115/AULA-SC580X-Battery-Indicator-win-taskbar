@@ -74,11 +74,16 @@ Quick actions available directly from the system tray:
 
 ## 🔬 How It Works (Technical Breakdown)
 
-### 1. Chipset Architecture
-The **AULA SC580X** runs on a **CompX** microcontroller receiver paired with a **PixArt PAW3311** optical sensor:
-- **Vendor ID (VID):** `0x3554` (Shenzhen Jiangmeng / CompX)
-- **Product ID (PID):** `0xFA09` (2.4G Wireless Receiver) & wired mode PIDs
-- **HID Usage Page:** `0xFF04` (Vendor-defined hardware command channel)
+### 1. Chipset Architecture & Dual Hardware Topology
+The **AULA SC580X** operates via dual hardware identities depending on the connection mode:
+- **Wireless 2.4GHz Mode:**
+  - **Receiver VID:** `0x3554` (CompX microcontroller)
+  - **Receiver PID:** `0xFA09` (2.4G Wireless Receiver)
+  - **HID Usage Page:** `0xFF04` (Vendor command channel)
+- **Wired Type-C Mode:**
+  - **Wired Device VID:** `0x088D` (USB Gaming Mouse)
+  - **Wired Device PID:** `0x062E`
+  - Instantly detected upon plugging in Type-C cable, activating the charging badge (`⚡`).
 
 ### 2. Direct Win32 HID Feature Querying
 The monitor queries the hardware directly using Windows user-mode HID APIs without installing proprietary drivers:
