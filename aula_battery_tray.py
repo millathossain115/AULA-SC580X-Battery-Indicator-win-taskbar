@@ -1,6 +1,7 @@
 """
 AULA SC580X Battery Monitor for Windows System Tray (Windows Native Edition)
 High-Visibility Monochromatic Segoe UI Typography with Wired Type-C Charging Detection.
+Single Instance protection via Win32 Named Mutex.
 Chipset: CompX (PixArt PAW3311), VID: 0x3554, PID: 0xFA09
 """
 
@@ -22,17 +23,38 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
+ERROR_ALREADY_EXISTS = 183
 
 kernel32 = ctypes.windll.kernel32
 hid_dll = ctypes.windll.hid
 
 APP_NAME = "AULA SC580X Battery Tray"
+MUTEX_NAME = r"Global\AULA_SC580X_Battery_Monitor_Mutex"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "AULASc580xBatteryTray"
 
 
+def ensure_single_instance():
+    """Ensure only one instance runs at a time using a Win32 Named Mutex."""
+    mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    last_error = kernel32.GetLastError()
+    if last_error == ERROR_ALREADY_EXISTS:
+        # Another instance is already running
+        try:
+            from win11toast import toast
+            toast(
+                "AULA SC580X Monitor",
+                "Application is already running in your system tray! Check near the taskbar clock (or ^ overflow menu)."
+            )
+        except Exception:
+            pass
+        return None
+    return mutex_handle
+
+
 class MouseBatteryMonitor:
-    def __init__(self):
+    def __init__(self, mutex_handle=None):
+        self.mutex_handle = mutex_handle
         self.battery_pct = 100
         self.is_connected = False
         self.is_charging = False
@@ -238,6 +260,9 @@ class MouseBatteryMonitor:
 
     def exit_app(self, icon, item):
         self.running = False
+        if self.mutex_handle:
+            kernel32.CloseHandle(self.mutex_handle)
+            self.mutex_handle = None
         icon.stop()
 
     def run(self):
@@ -271,5 +296,9 @@ class MouseBatteryMonitor:
 
 
 if __name__ == "__main__":
-    app = MouseBatteryMonitor()
+    mutex = ensure_single_instance()
+    if not mutex:
+        sys.exit(0)
+
+    app = MouseBatteryMonitor(mutex_handle=mutex)
     app.run()

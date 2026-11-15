@@ -66,6 +66,7 @@ Quick actions available directly from the system tray:
 - **Sleep & Disconnect Awareness:** Gracefully displays `?` when the mouse enters power-saving sleep or the dongle is removed.
 - **Start with Windows:** Toggle automatic launch at system boot directly from the right-click menu (writes cleanly to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
 - **Instant Manual Refresh:** Right-click and hit **"Refresh Now"** whenever you want an on-demand hardware poll.
+- **Single-Instance Protection:** Built-in Win32 Named Mutex prevents duplicate background processes and duplicate tray icons; clicking the application again triggers a friendly desktop toast reminding you that it is already active.
 - **Zero OEM Bloat:** Ultra-lightweight footprint (~25 MB compiled, 0% idle CPU).
 
 ---
