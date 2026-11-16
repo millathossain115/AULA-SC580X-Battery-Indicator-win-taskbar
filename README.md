@@ -97,7 +97,7 @@ sequenceDiagram
     App->>Mouse: Request Feature Report ID 6 (HidD_GetFeature)
     Mouse-->>App: 8-byte payload: [0x06, Flags, Mode, Pct, ...]
     Note over App: Parse Pct (data[3]) & Charging status (data[1], data[2], wired PID)
-    App->>App: Render supersampled 128x128 icon with Lanczos scaling
+    App->>App: Render native DPI-aware icon with Win32 1:1 LoadImage mapping
     App->>Win32: Update System Tray Icon & Tooltip
 ```
 

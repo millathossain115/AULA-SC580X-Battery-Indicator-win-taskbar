@@ -9,13 +9,31 @@ import os
 import sys
 import time
 import threading
+import traceback
 import winreg
 import ctypes
 from ctypes import wintypes
+import contextlib
+import tempfile
+import psutil
 import hid
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 from pystray import MenuItem as item
+
+# Log all unhandled exceptions to crash.log for debugging
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    log_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(log_dir, "crash.log")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n--- CRASH AT {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+
+sys.excepthook = handle_exception
+threading.excepthook = lambda args: handle_exception(args.exc_type, args.exc_value, args.exc_traceback)
 
 # Win32 Constants
 GENERIC_READ = 0x80000000
@@ -27,16 +45,65 @@ ERROR_ALREADY_EXISTS = 183
 
 kernel32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
 hid_dll = ctypes.windll.hid
 
-# Enable High-DPI Awareness so Windows gives true pixel coordinates
+# Enable High-DPI Awareness so Windows reports physical tray pixel coordinates
 try:
-    user32.SetProcessDPIAware()
+    user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # Per-Monitor V2
+except Exception:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+# Monkey-patch pystray._win32 to:
+# 1. Save ICO with exact native dimensions sizes=[(image.width, image.height)]
+#    avoiding Pillow's default downsampling.
+# 2. Call LoadImage with exact pixel width/height (avoiding LR_DEFAULTSIZE stretch distortion).
+try:
+    import pystray._win32 as _pystray_win32
+
+    @contextlib.contextmanager
+    def _custom_serialized_image(image, format, extension=None):
+        fd, path = tempfile.mkstemp('.%s' % (extension or format.lower()))
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                if str(format).upper() == 'ICO':
+                    image.save(f, format='ICO', sizes=[(image.width, image.height)])
+                else:
+                    image.save(f, format=format)
+            yield path
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    _pystray_win32.serialized_image = _custom_serialized_image
+
+    def _custom_assert_icon_handle(self):
+        if self._icon_handle:
+            return
+        with _custom_serialized_image(self.icon, 'ICO') as icon_path:
+            self._icon_handle = _pystray_win32.win32.LoadImage(
+                None,
+                icon_path,
+                _pystray_win32.win32.IMAGE_ICON,
+                self.icon.width,
+                self.icon.height,
+                _pystray_win32.win32.LR_LOADFROMFILE
+            )
+
+    _pystray_win32.Icon._assert_icon_handle = _custom_assert_icon_handle
 except Exception:
     pass
 
 APP_NAME = "AULA SC580X Battery Tray"
-MUTEX_NAME = r"Global\AULA_SC580X_Battery_Monitor_Mutex"
+MUTEX_NAME = r"Local\AULA_SC580X_Battery_Monitor_Mutex"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "AULASc580xBatteryTray"
 
@@ -48,19 +115,33 @@ WIRED_PID = 0x062E
 
 
 def ensure_single_instance():
-    """Ensure only one instance runs at a time using a Win32 Named Mutex."""
+    """
+    Ensure only one instance runs at a time.
+    If an existing or zombie instance is already running, terminate it so this
+    newly launched instance takes over cleanly.
+    """
+    try:
+        curr_pid = os.getpid()
+        parent_pid = os.getppid()
+        killed_any = False
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                pid = p.info['pid']
+                if pid in (curr_pid, parent_pid):
+                    continue
+                pname = str(p.info['name']).lower()
+                cmdline = ' '.join(p.info['cmdline'] or []).lower()
+                if 'aula_sc580x_battery' in pname or 'aula_battery_tray.py' in cmdline:
+                    p.kill()
+                    killed_any = True
+            except Exception:
+                pass
+        if killed_any:
+            time.sleep(0.5)
+    except Exception:
+        pass
+
     mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    last_error = kernel32.GetLastError()
-    if last_error == ERROR_ALREADY_EXISTS:
-        try:
-            from win11toast import toast
-            toast(
-                "AULA SC580X Monitor",
-                "Application is already running in your system tray! Check near the taskbar clock (or ^ overflow menu)."
-            )
-        except Exception:
-            pass
-        return None
     return mutex_handle
 
 
@@ -73,6 +154,7 @@ class MouseBatteryMonitor:
         self.low_battery_warned = False
         self.poll_interval = 4  # 4-second poll for instant cable reaction
         self.running = True
+        self.show_gauge_bar = False
         self.icon = None
 
         # Determine user's exact Windows system tray icon resolution
@@ -148,88 +230,145 @@ class MouseBatteryMonitor:
         except Exception:
             return False, None, False
 
+    def _get_best_font(self, size):
+        font_paths = [
+            "C:/Windows/Fonts/segoeui.ttf",
+            "segoeui.ttf",
+            "C:/Windows/Fonts/SegUIVar.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "arial.ttf"
+        ]
+        for fp in font_paths:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
     def generate_crisp_icon(self, percentage, connected, is_charging=False):
         """
         Generate pixel-perfect native resolution icon matching user's exact Windows tray DPI:
-        - Pure solid 100% intense white (#FFFFFF) with zero color bleeding/fading
-        - Maximized Segoe UI Bold typography filling the space above the gauge bar
-        - Monochromatic gauge bar at the bottom
-        - Crisp lightning bolt when charging
+        - Pure Segoe UI Regular typography matching Windows Time & Date font weight (400)
+        - Maximized full-tile height (13-14 physical pixels tall), completely un-squished
+        - No cluttering bottom underline bar (clean, open typography matching taskbar clock)
+        - Pure solid 100% white (#FFFFFF) numbers with pristine Lanczos subpixel sharpness
+        - Sleek lightning bolt badge when Type-C wired charging
         """
-        # Render on 2x retina buffer for clean integer downsampling
-        buf_size = self.tray_size * 2
+        scale = 4
+        buf_size = self.tray_size * scale
         img = Image.new('RGBA', (buf_size, buf_size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        # 1. Monochromatic slim gauge bar at bottom
-        bar_h = max(3, int(buf_size * 0.10))
-        bar_y1 = buf_size - bar_h - 2
-        bar_y2 = buf_size - 2
-        draw.rounded_rectangle([1, bar_y1, buf_size - 2, bar_y2], radius=1, fill=(40, 44, 52, 230))
+        # Optional bottom bar (disabled by default for pure taskbar-clock typography)
+        bar_h = max(2 * scale, int(buf_size * 0.10)) if self.show_gauge_bar else 0
+        bar_y1 = buf_size - bar_h if self.show_gauge_bar else buf_size
+        bar_y2 = buf_size - 1
 
-        if connected:
-            fill_w = max(3, int((buf_size - 3) * (percentage / 100.0)))
-            # Pure solid high-intensity white
-            draw.rounded_rectangle([1, bar_y1, 1 + fill_w, bar_y2], radius=1, fill=(255, 255, 255, 255))
-        else:
-            draw.rounded_rectangle([1, bar_y1, 6, bar_y2], radius=1, fill=(180, 60, 60, 255))
+        if self.show_gauge_bar:
+            draw.rectangle([0, bar_y1, buf_size - 1, bar_y2], fill=(45, 50, 58, 255))
+            if connected:
+                fill_pct = max(0.0, min(1.0, (percentage if percentage is not None else 100) / 100.0))
+                fill_w = max(int(scale * 1.5), int((buf_size - 1) * fill_pct))
+                draw.rectangle([0, bar_y1, fill_w, bar_y2], fill=(255, 255, 255, 255))
+            else:
+                draw.rectangle([0, bar_y1, int(buf_size * 0.35), bar_y2], fill=(220, 65, 65, 255))
 
-        # 2. Number on top
+        avail_h = bar_y1 - (2 if self.show_gauge_bar else 0)
+        avail_w = buf_size
         text = "?" if not connected else str(percentage)
-        font_path = "C:/Windows/Fonts/segoeuib.ttf"
 
+        # Typography & Charging Badge
         if connected and is_charging:
-            # Scaled number on left with sharp lightning bolt on right
-            fsize = int(buf_size * 0.50) if len(text) == 3 else int(buf_size * 0.70)
-            try:
-                font = ImageFont.truetype(font_path, fsize)
-            except Exception:
-                font = ImageFont.load_default()
+            if len(text) == 3:  # 100% Charging
+                f = self._get_best_font(56)
+                bbox = f.getbbox(text)
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
 
-            x_num = int(buf_size * 0.35)
-            y_num = (bar_y1) // 2
+                th = int(avail_h * 0.70)
+                tw = int(avail_w * 0.74)
+                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+                img.paste(stretched, (0, (avail_h - th) // 2), stretched)
 
-            # Pure 100% solid white
-            draw.text((x_num, y_num), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
+                # Sleek lightning bolt badge on right
+                bx = int(avail_w * 0.84)
+                by1 = int(avail_h * 0.16)
+                bh_bolt = int(avail_h * 0.68)
+                bolt = [
+                    (bx + 3, by1),
+                    (bx - 7, by1 + int(bh_bolt * 0.45)),
+                    (bx + 0, by1 + int(bh_bolt * 0.45)),
+                    (bx - 7, by1 + bh_bolt),
+                    (bx + 11, by1 + int(bh_bolt * 0.38)),
+                    (bx + 1, by1 + int(bh_bolt * 0.38)),
+                ]
+                draw.polygon(bolt, fill=(255, 255, 255, 255))
 
-            # Lightning bolt (sharp solid white)
-            bx = int(buf_size * 0.80)
-            by = 4
-            bolt_h = int(buf_size * 0.58)
-            bolt_pts = [
-                (bx + 3,  by + 0),
-                (bx - 4,  by + int(bolt_h * 0.44)),
-                (bx + 0,  by + int(bolt_h * 0.44)),
-                (bx - 4,  by + bolt_h),
-                (bx + 6,  by + int(bolt_h * 0.36)),
-                (bx + 1,  by + int(bolt_h * 0.36))
-            ]
-            draw.polygon(bolt_pts, fill=(255, 255, 255, 255))
+            else:  # 1 or 2 digits Charging (e.g. 85, 20)
+                f = self._get_best_font(56)
+                bbox = f.getbbox(text)
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
 
-        else:
-            # Full width number centered with maximum scale
-            fsize = int(buf_size * 0.58) if len(text) == 3 else int(buf_size * 0.78)
-            try:
-                font = ImageFont.truetype(font_path, fsize)
-            except Exception:
-                font = ImageFont.load_default()
+                th = int(avail_h * 0.72)
+                tw = min(int(avail_w * 0.62), int(th * (bw / bh)))
+                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+                img.paste(stretched, (2, (avail_h - th) // 2), stretched)
 
-            x = buf_size // 2
-            y = (bar_y1) // 2
+                # Sleek lightning bolt on right
+                bx = int(avail_w * 0.81)
+                by1 = int(avail_h * 0.16)
+                bh_bolt = int(avail_h * 0.68)
+                bolt = [
+                    (bx + 3, by1),
+                    (bx - 7, by1 + int(bh_bolt * 0.45)),
+                    (bx + 0, by1 + int(bh_bolt * 0.45)),
+                    (bx - 7, by1 + bh_bolt),
+                    (bx + 11, by1 + int(bh_bolt * 0.38)),
+                    (bx + 1, by1 + int(bh_bolt * 0.38)),
+                ]
+                draw.polygon(bolt, fill=(255, 255, 255, 255))
 
-            fill_col = (180, 185, 195, 255) if not connected else (255, 255, 255, 255)
-            draw.text((x, y), text, font=font, fill=fill_col, anchor="mm")
+        else:  # Normal or Disconnected
+            if len(text) == 3:  # 100% normal
+                f = self._get_best_font(56)
+                bbox = f.getbbox(text)
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
 
-        # Downsample cleanly to user's exact native tray icon size
+                tw = int(avail_w * 0.94)
+                th = int(avail_h * 0.72)
+                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+                img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
+
+            else:  # 1 or 2 digits or '?'
+                f = self._get_best_font(56)
+                col = (200, 205, 215, 255) if not connected else (255, 255, 255, 255)
+                bbox = f.getbbox(text)
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=col)
+
+                th = int(avail_h * 0.72)
+                tw = min(int(avail_w * 0.92), int(th * (bw / bh)))
+                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+                img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
+
+        # Pure Lanczos downsampling to native resolution for razor-sharp subpixel rendering
         return img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
 
     def send_notification(self, title, message):
-        """Send native Windows toast notification"""
-        try:
-            from win11toast import toast
-            toast(title, message)
-        except Exception:
-            pass
+        """Send native Windows toast notification asynchronously"""
+        def _show():
+            try:
+                from win11toast import toast
+                toast(title, message)
+            except Exception:
+                pass
+        threading.Thread(target=_show, daemon=True).start()
 
     def check_startup_enabled(self):
         try:
@@ -305,6 +444,10 @@ class MouseBatteryMonitor:
             self.is_charging = False
         self._update_ui()
 
+    def toggle_gauge_bar(self, icon, item):
+        self.show_gauge_bar = not self.show_gauge_bar
+        self._update_ui()
+
     def exit_app(self, icon, item):
         self.running = False
         if self.mutex_handle:
@@ -327,12 +470,22 @@ class MouseBatteryMonitor:
             item(lambda text: self._get_status_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
             item("Refresh Now", self.manual_refresh),
+            item("Show Bottom Bar", self.toggle_gauge_bar, checked=lambda item: self.show_gauge_bar),
             item("Start with Windows", self.toggle_startup, checked=lambda item: self.check_startup_enabled()),
             pystray.Menu.SEPARATOR,
             item("Exit", self.exit_app)
         )
 
         self.icon = pystray.Icon("AULASc580xBattery", init_icon, self._get_status_text(), menu)
+
+        # Notify user on startup so they know it is active and where to find it
+        status_desc = f"{self.battery_pct}%" if self.is_connected else "Disconnected (?)"
+        if self.is_charging:
+            status_desc += " ⚡ (Charging)"
+        self.send_notification(
+            "AULA SC580X Monitor",
+            f"Battery: {status_desc} • Active in System Tray\n(If hidden, click '^' near clock & drag icon to taskbar)"
+        )
 
         # Start background polling thread
         worker = threading.Thread(target=self.poll_loop, daemon=True)
