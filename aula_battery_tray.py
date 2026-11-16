@@ -279,85 +279,29 @@ class MouseBatteryMonitor:
         avail_w = buf_size
         text = "?" if not connected else str(percentage)
 
-        # Typography & Charging Badge
-        if connected and is_charging:
-            if len(text) == 3:  # 100% Charging
-                f = self._get_best_font(56)
-                bbox = f.getbbox(text)
-                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
-                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
+        # Determine text color:
+        # - Charging / Type-C Wired: Active vibrant Windows blue (matches active mic indicator)
+        # - Disconnected: Muted / soft grey
+        # - Normal Battery: 100% Solid pure white
+        if not connected:
+            text_color = (200, 205, 215, 255)
+        elif is_charging:
+            text_color = (56, 175, 255, 255)  # Windows 11 Active Accent Blue (#38AFFF)
+        else:
+            text_color = (255, 255, 255, 255)
 
-                th = int(avail_h * 0.70)
-                tw = int(avail_w * 0.74)
-                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
-                img.paste(stretched, (0, (avail_h - th) // 2), stretched)
+        # Unified typography layout (preserves consistent maximum size across all states)
+        f = self._get_best_font(56)
+        bbox = f.getbbox(text)
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+        ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=text_color)
 
-                # Sleek lightning bolt badge on right
-                bx = int(avail_w * 0.84)
-                by1 = int(avail_h * 0.16)
-                bh_bolt = int(avail_h * 0.68)
-                bolt = [
-                    (bx + 3, by1),
-                    (bx - 7, by1 + int(bh_bolt * 0.45)),
-                    (bx + 0, by1 + int(bh_bolt * 0.45)),
-                    (bx - 7, by1 + bh_bolt),
-                    (bx + 11, by1 + int(bh_bolt * 0.38)),
-                    (bx + 1, by1 + int(bh_bolt * 0.38)),
-                ]
-                draw.polygon(bolt, fill=(255, 255, 255, 255))
-
-            else:  # 1 or 2 digits Charging (e.g. 85, 20)
-                f = self._get_best_font(56)
-                bbox = f.getbbox(text)
-                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
-                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
-
-                th = int(avail_h * 0.72)
-                tw = min(int(avail_w * 0.62), int(th * (bw / bh)))
-                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
-                img.paste(stretched, (2, (avail_h - th) // 2), stretched)
-
-                # Sleek lightning bolt on right
-                bx = int(avail_w * 0.81)
-                by1 = int(avail_h * 0.16)
-                bh_bolt = int(avail_h * 0.68)
-                bolt = [
-                    (bx + 3, by1),
-                    (bx - 7, by1 + int(bh_bolt * 0.45)),
-                    (bx + 0, by1 + int(bh_bolt * 0.45)),
-                    (bx - 7, by1 + bh_bolt),
-                    (bx + 11, by1 + int(bh_bolt * 0.38)),
-                    (bx + 1, by1 + int(bh_bolt * 0.38)),
-                ]
-                draw.polygon(bolt, fill=(255, 255, 255, 255))
-
-        else:  # Normal or Disconnected
-            if len(text) == 3:  # 100% normal
-                f = self._get_best_font(56)
-                bbox = f.getbbox(text)
-                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
-                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=(255, 255, 255, 255))
-
-                tw = int(avail_w * 0.94)
-                th = int(avail_h * 0.72)
-                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
-                img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
-
-            else:  # 1 or 2 digits or '?'
-                f = self._get_best_font(56)
-                col = (200, 205, 215, 255) if not connected else (255, 255, 255, 255)
-                bbox = f.getbbox(text)
-                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
-                ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=col)
-
-                th = int(avail_h * 0.72)
-                tw = min(int(avail_w * 0.92), int(th * (bw / bh)))
-                stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
-                img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
+        th = int(avail_h * 0.70)
+        max_w = int(avail_w * 0.96) if len(text) == 3 else int(avail_w * 0.92)
+        tw = min(max_w, int(th * (bw / bh)))
+        stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+        img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
 
         # Pure Lanczos downsampling to native resolution for razor-sharp subpixel rendering
         final_icon = img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
