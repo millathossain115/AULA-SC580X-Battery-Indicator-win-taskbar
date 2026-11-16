@@ -232,6 +232,8 @@ class MouseBatteryMonitor:
 
     def _get_best_font(self, size):
         font_paths = [
+            "C:/Windows/Fonts/seguisb.ttf",
+            "seguisb.ttf",
             "C:/Windows/Fonts/segoeui.ttf",
             "segoeui.ttf",
             "C:/Windows/Fonts/SegUIVar.ttf",
@@ -358,7 +360,22 @@ class MouseBatteryMonitor:
                 img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
 
         # Pure Lanczos downsampling to native resolution for razor-sharp subpixel rendering
-        return img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
+        final_icon = img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
+
+        # Boost stroke core alpha so numbers achieve solid 100% white (#FFFFFF) intensity
+        # while keeping smooth subpixel anti-aliasing on the edges
+        r, g_ch, b, a = final_icon.split()
+        lut = []
+        for i in range(256):
+            if i < 35:
+                lut.append(0)
+            elif i < 110:
+                lut.append(int((i - 35) * (180.0 / 75.0)))
+            else:
+                v = int(180 + (i - 110) * (75.0 / 145.0) * 1.5)
+                lut.append(min(255, v))
+        a_boosted = a.point(lut)
+        return Image.merge('RGBA', (r, g_ch, b, a_boosted))
 
     def send_notification(self, title, message):
         """Send native Windows toast notification asynchronously"""
