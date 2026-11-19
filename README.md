@@ -38,7 +38,7 @@ The tray icon adapts dynamically to your mouse status with clean, high-contrast 
 | **Fully Charged** | `100` | Complete 100% battery capacity |
 | **Normal Use** | `85` (Large Number) | Crisp, noticeable monochromatic digits filling the tray tile |
 | **Type-C Charging** | `85⚡` | Automatically detects Type-C wired charging connection |
-| **Low Battery Alert** | `15` | Battery $\le 20\%$; triggers desktop toast alert |
+| **Low Battery Alert** | `20` / `10` (Red Blink) | Battery $\le 20\%$ turns digits vibrant Red (`#FF2D2D`) and blinks (urgent speed at $\le 10\%$); desktop toast |
 | **Disconnected / Sleep** | `?` | Dongle unplugged or mouse is in sleep mode |
 
 ---
@@ -63,7 +63,7 @@ Quick actions available directly from the system tray:
 - **Maximized & Noticeable Digits:** Dynamically scales typography (up to 110pt font) to fill the entire upper tile above the gauge bar with a 3-pixel radial contrast outline for maximum visibility on High-DPI screens.
 - **Monochromatic Battery Gauge Bar:** Retains the glanceable bottom battery level bar rendered in high-contrast dark-slate and bright silver/white, scaling smoothly with remaining battery percentage.
 - **Type-C Wired & Charging Detection:** Automatically senses when the mouse is connected via USB Type-C cable, displaying an active lightning bolt badge (`⚡`) and updating status to *Charging*.
-- **Low-Battery Toast Notifications:** Sends a native Windows 10/11 banner alert when battery drops to **20% or below** so you never get interrupted.
+- **Low-Battery Toast & Red Blinking Alerts:** When battery drops to **20% or below**, the tray numbers turn vibrant alert Red (`#FF2D2D`) and blink (at steady rate for $\le 20\%$ and urgent rate for $\le 10\%$), alongside a native Windows toast notification so you never get cut off mid-session. Immediately stops blinking and switches to active blue once Type-C charging begins.
 - **Sleep & Disconnect Awareness:** Gracefully displays `?` when the mouse enters power-saving sleep or the dongle is removed.
 - **Start with Windows:** Toggle automatic launch at system boot directly from the right-click menu (writes cleanly to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
 - **Instant Manual Refresh:** Right-click and hit **"Refresh Now"** whenever you want an on-demand hardware poll.

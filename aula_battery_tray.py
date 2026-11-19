@@ -194,9 +194,21 @@ class MouseBatteryMonitor:
         self.running = True
         self.show_gauge_bar = False
         self.icon = None
+        self.blink_state = False
+        self.ui_lock = threading.Lock()
 
         # Determine user's exact Windows system tray icon resolution
         self.tray_size = self._get_native_tray_size()
+
+    @property
+    def is_low_battery(self):
+        """Returns True if battery is in low warning state (<= 20%) while discharging"""
+        return (
+            self.is_connected
+            and not self.is_charging
+            and self.battery_pct is not None
+            and self.battery_pct <= 20
+        )
 
     def _load_cache(self):
         """Load last known battery percentage from disk cache"""
@@ -446,7 +458,7 @@ class MouseBatteryMonitor:
                 continue
         return ImageFont.load_default()
 
-    def generate_crisp_icon(self, percentage, connected, is_charging=False):
+    def generate_crisp_icon(self, percentage, connected, is_charging=False, blink_off=False):
         """
         Generate pixel-perfect native resolution icon matching user's exact Windows tray DPI:
         - Pure Segoe UI Regular typography matching Windows Time & Date font weight (400)
@@ -454,11 +466,15 @@ class MouseBatteryMonitor:
         - No cluttering bottom underline bar (clean, open typography matching taskbar clock)
         - Pure solid 100% white (#FFFFFF) numbers with pristine Lanczos subpixel sharpness
         - Active Windows blue (#38AFFF) typography when Type-C wired charging
+        - Vibrant alert red (#FF2D2D) and blinking alert state on low battery (<= 20% or 10%)
         """
         scale = 4
         buf_size = self.tray_size * scale
         img = Image.new('RGBA', (buf_size, buf_size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
+
+        # Check if mouse is in low battery state
+        is_low = (connected and not is_charging and percentage is not None and percentage <= 20)
 
         # Optional bottom bar (disabled by default for pure taskbar-clock typography)
         bar_h = max(2 * scale, int(buf_size * 0.10)) if self.show_gauge_bar else 0
@@ -470,7 +486,8 @@ class MouseBatteryMonitor:
             if connected:
                 fill_pct = max(0.0, min(1.0, (percentage if percentage is not None else 100) / 100.0))
                 fill_w = max(int(scale * 1.5), int((buf_size - 1) * fill_pct))
-                draw.rectangle([0, bar_y1, fill_w, bar_y2], fill=(255, 255, 255, 255))
+                bar_color = (255, 45, 45, 255) if is_low else (255, 255, 255, 255)
+                draw.rectangle([0, bar_y1, fill_w, bar_y2], fill=bar_color)
             else:
                 draw.rectangle([0, bar_y1, int(buf_size * 0.35), bar_y2], fill=(220, 65, 65, 255))
 
@@ -480,32 +497,36 @@ class MouseBatteryMonitor:
 
         # Determine text color:
         # - Charging / Type-C Wired: Active vibrant Windows blue (#38AFFF)
-        # - Disconnected: Muted / soft grey
-        # - Normal Battery: 100% Solid pure white
+        # - Disconnected: Muted / soft grey (#C8CDD7)
+        # - Low Battery (<= 20%): Vibrant High-Contrast Alert Red (#FF2D2D)
+        # - Normal Battery: 100% Solid pure white (#FFFFFF)
         if not connected:
             text_color = (200, 205, 215, 255)
         elif is_charging:
             text_color = (56, 175, 255, 255)  # Windows 11 Active Accent Blue (#38AFFF)
+        elif is_low:
+            text_color = (255, 45, 45, 255)   # Vibrant High-Contrast Alert Red (#FF2D2D)
         else:
             text_color = (255, 255, 255, 255)
 
-        # Unified typography layout (preserves consistent maximum size across all states)
-        f = self._get_best_font(56)
-        bbox = f.getbbox(text)
-        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
-        ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=text_color)
+        # Only draw typography when not in the "off" phase of a blink
+        if not blink_off:
+            f = self._get_best_font(56)
+            bbox = f.getbbox(text)
+            bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            g = Image.new('RGBA', (bw + 8, bh + 8), (0, 0, 0, 0))
+            ImageDraw.Draw(g).text((4 - bbox[0], 4 - bbox[1]), text, font=f, fill=text_color)
 
-        th = int(avail_h * 0.70)
-        max_w = int(avail_w * 0.96) if len(text) == 3 else int(avail_w * 0.92)
-        tw = min(max_w, int(th * (bw / bh)))
-        stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
-        img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
+            th = int(avail_h * 0.70)
+            max_w = int(avail_w * 0.96) if len(text) == 3 else int(avail_w * 0.92)
+            tw = min(max_w, int(th * (bw / bh)))
+            stretched = g.resize((tw, th), Image.Resampling.LANCZOS)
+            img.paste(stretched, ((avail_w - tw) // 2, (avail_h - th) // 2), stretched)
 
         # Pure Lanczos downsampling to native resolution for razor-sharp subpixel rendering
         final_icon = img.resize((self.tray_size, self.tray_size), Image.Resampling.LANCZOS)
 
-        # Boost stroke core alpha so numbers achieve solid 100% white (#FFFFFF) intensity
+        # Boost stroke core alpha so numbers achieve solid intensity
         # while keeping smooth subpixel anti-aliasing on the edges
         r, g_ch, b, a = final_icon.split()
         lut = []
@@ -561,12 +582,39 @@ class MouseBatteryMonitor:
             return "AULA SC580X: Disconnected"
         if self.is_charging:
             return f"AULA SC580X: {self.battery_pct}% ⚡ (Charging / Wired)"
+        if self.is_low_battery:
+            return f"AULA SC580X: {self.battery_pct}% ⚠️ (Low Battery - Recharge Soon!)"
         return f"AULA SC580X: {self.battery_pct}%"
 
     def _update_ui(self):
-        if self.icon:
-            self.icon.icon = self.generate_crisp_icon(self.battery_pct, self.is_connected, self.is_charging)
-            self.icon.title = self._get_status_text()
+        with self.ui_lock:
+            if self.icon:
+                try:
+                    blink_off = self.blink_state if self.is_low_battery else False
+                    self.icon.icon = self.generate_crisp_icon(
+                        self.battery_pct,
+                        self.is_connected,
+                        self.is_charging,
+                        blink_off=blink_off
+                    )
+                    self.icon.title = self._get_status_text()
+                except Exception:
+                    pass
+
+    def _blink_loop(self):
+        """Dedicated background thread for low battery red blinking alert"""
+        while self.running:
+            if self.is_low_battery:
+                # Urgent 0.45s blink for critical <= 10%, steady 0.75s blink for <= 20%
+                interval = 0.45 if (self.battery_pct is not None and self.battery_pct <= 10) else 0.75
+                self.blink_state = not self.blink_state
+                self._update_ui()
+                time.sleep(interval)
+            else:
+                if self.blink_state:
+                    self.blink_state = False
+                    self._update_ui()
+                time.sleep(0.5)
 
     def poll_loop(self):
         while self.running:
@@ -656,6 +704,10 @@ class MouseBatteryMonitor:
         # Start background polling thread
         worker = threading.Thread(target=self.poll_loop, daemon=True)
         worker.start()
+
+        # Start low-battery red blink worker thread
+        blink_worker = threading.Thread(target=self._blink_loop, daemon=True)
+        blink_worker.start()
 
         # Run system tray event loop
         self.icon.run()
