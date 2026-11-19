@@ -1,13 +1,19 @@
 """
 AULA SC580X Battery Monitor for Windows System Tray (Native Resolution High-Luminance Edition)
 Pure Solid High-Intensity White Typography with Native 1:1 Tray Pixel Alignment,
-Bottom Monochromatic Level Bar, Type-C Wired Charging Detection, and Single-Instance Mutex.
-Chipset: CompX (PixArt PAW3311), Wireless VID: 0x3554, PID: 0xFA09 | Wired VID: 0x088D, PID: 0x062E
+Bottom Monochromatic Level Bar, Type-C Wired Charging Detection, Exact 1% Granularity Sync,
+RF Sleep State Retention, and Single-Instance Mutex.
+
+Hardware Support:
+- AULA SC580X Wireless Receiver: VID 0x089D, PID 0x062F (Usage Page 0xFF02, 33-byte In/Out Report)
+- AULA SC580X Type-C Wired Mode: VID 0x088D, PID 0x062E
+- CompX PAW3311 Wireless Fallback: VID 0x3554, PID 0xFA09
 """
 
 import os
 import sys
 import time
+import json
 import threading
 import traceback
 import winreg
@@ -41,12 +47,36 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
+FILE_FLAG_OVERLAPPED = 0x40000000
 ERROR_ALREADY_EXISTS = 183
 
 kernel32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 hid_dll = ctypes.windll.hid
+
+class OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ('Internal', ctypes.c_size_t),
+        ('InternalHigh', ctypes.c_size_t),
+        ('Offset', wintypes.DWORD),
+        ('OffsetHigh', wintypes.DWORD),
+        ('hEvent', wintypes.HANDLE)
+    ]
+
+class MODULEENTRY32(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('th32ModuleID', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('GlblcntUsage', wintypes.DWORD),
+        ('ProccntUsage', wintypes.DWORD),
+        ('modBaseAddr', ctypes.c_void_p),
+        ('modBaseSize', wintypes.DWORD),
+        ('hModule', wintypes.HMODULE),
+        ('szModule', ctypes.c_char * 256),
+        ('szExePath', ctypes.c_char * 260)
+    ]
 
 # Enable High-DPI Awareness so Windows reports physical tray pixel coordinates
 try:
@@ -108,10 +138,18 @@ STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "AULASc580xBatteryTray"
 
 # Hardware IDs for AULA SC580X
-WIRELESS_VID = 0x3554
-WIRELESS_PID = 0xFA09
-WIRED_VID = 0x088D
-WIRED_PID = 0x062E
+AULA_WIRELESS_VID = 0x089D
+AULA_WIRELESS_PID = 0x062F
+AULA_WIRED_VID = 0x088D
+AULA_WIRED_PID = 0x062E
+
+# Secondary / CompX Fallback IDs
+COMPX_WIRELESS_VID = 0x3554
+COMPX_WIRELESS_PID = 0xFA09
+
+# Persistent Cache Path
+CACHE_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'AULA_SC580X_Battery')
+CACHE_FILE = os.path.join(CACHE_DIR, 'cache.json')
 
 
 def ensure_single_instance():
@@ -148,17 +186,43 @@ def ensure_single_instance():
 class MouseBatteryMonitor:
     def __init__(self, mutex_handle=None):
         self.mutex_handle = mutex_handle
-        self.battery_pct = 100
+        self.battery_pct = self._load_cache() or 100
         self.is_connected = False
         self.is_charging = False
         self.low_battery_warned = False
-        self.poll_interval = 4  # 4-second poll for instant cable reaction
+        self.poll_interval = 4  # 4-second poll interval
         self.running = True
         self.show_gauge_bar = False
         self.icon = None
 
         # Determine user's exact Windows system tray icon resolution
         self.tray_size = self._get_native_tray_size()
+
+    def _load_cache(self):
+        """Load last known battery percentage from disk cache"""
+        try:
+            if os.path.exists(CACHE_FILE):
+                with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    pct = data.get('battery_pct')
+                    if pct is not None and 0 <= pct <= 100:
+                        return int(pct)
+        except Exception:
+            pass
+        return None
+
+    def _save_cache(self):
+        """Save current battery percentage to disk cache"""
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'battery_pct': self.battery_pct,
+                    'is_charging': self.is_charging,
+                    'updated_at': time.time()
+                }, f)
+        except Exception:
+            pass
 
     def _get_native_tray_size(self):
         try:
@@ -169,28 +233,149 @@ class MouseBatteryMonitor:
             pass
         return 20  # Default for 125% DPI displays
 
-    def read_battery_hid(self):
-        """Query the AULA mouse via HID Feature Report ID 6 and detect Type-C wired connection"""
+    def _read_cbmouse_memory(self):
+        """
+        If official CBMouse.exe is currently active, read real-time synchronized
+        battery and charging state directly from its process memory.
+        """
         try:
-            all_devices = hid.enumerate()
+            for p in psutil.process_iter(['pid', 'name']):
+                if p.info['name'] and p.info['name'].lower() == 'cbmouse.exe':
+                    pid = p.info['pid']
+                    hSnap = kernel32.CreateToolhelp32Snapshot(0x8 | 0x10, pid)
+                    me = MODULEENTRY32()
+                    me.dwSize = ctypes.sizeof(MODULEENTRY32)
+                    base = None
+                    if kernel32.Module32First(hSnap, ctypes.byref(me)):
+                        while True:
+                            if b'cbmouse' in me.szModule.lower():
+                                base = me.modBaseAddr
+                                break
+                            if not kernel32.Module32Next(hSnap, ctypes.byref(me)):
+                                break
+                    kernel32.CloseHandle(hSnap)
+                    if not base:
+                        continue
+                    delta = base - 0x400000
+                    hProc = kernel32.OpenProcess(0x10, False, pid)
+                    if not hProc:
+                        continue
+                    try:
+                        buf4 = (ctypes.c_char * 4)()
+                        read = ctypes.c_size_t()
+                        # Read active device pointer at 0x5efcac + delta
+                        if kernel32.ReadProcessMemory(hProc, ctypes.c_void_p(0x5efcac + delta), buf4, 4, ctypes.byref(read)):
+                            import struct
+                            pActive = struct.unpack('<I', buf4.raw)[0]
+                            if pActive:
+                                dev_buf = (ctypes.c_char * 0x2d8)()
+                                if kernel32.ReadProcessMemory(hProc, ctypes.c_void_p(pActive), dev_buf, 0x2d8, ctypes.byref(read)):
+                                    nPower = struct.unpack_from('<I', dev_buf.raw, 0x2cc)[0]
+                                    nCharging = struct.unpack_from('<I', dev_buf.raw, 0x2d0)[0]
+                                    bOnline = struct.unpack_from('<I', dev_buf.raw, 0x284)[0]
+                                    if 0 <= nPower <= 100:
+                                        return True, nPower, bool(nCharging)
+                    finally:
+                        kernel32.CloseHandle(hProc)
+        except Exception:
+            pass
+        return False, None, False
 
-            # 1. Check if mouse is wired directly via Type-C cable
-            is_wired = any(
-                (d.get('vendor_id') == WIRED_VID and d.get('product_id') == WIRED_PID) or
-                (d.get('vendor_id') == WIRELESS_VID and d.get('product_id') != WIRELESS_PID) or
-                (d.get('vendor_id') in [WIRED_VID, WIRELESS_VID] and
-                 'mouse' in str(d.get('product_string', '')).lower() and
-                 'receiver' not in str(d.get('product_string', '')).lower())
-                for d in all_devices
+    def _query_sc580x_hid(self):
+        """
+        Query AULA SC580X wireless dongle directly on Usage Page 0xFF02 via 33-byte HID reports.
+        Returns: (is_connected: bool, new_pct: int | None, is_charging: bool)
+        - new_pct is None if mouse is in RF Sleep (status == 2), preserving current percentage.
+        - new_pct is an exact 1-100% integer when online (status == 0).
+        """
+        all_devs = hid.enumerate()
+
+        # 1. Check if mouse is connected directly via Type-C wired cable
+        is_wired = any(
+            (d.get('vendor_id') == AULA_WIRED_VID and d.get('product_id') == AULA_WIRED_PID)
+            for d in all_devs
+        )
+
+        # 2. Locate SC580X wireless receiver on Usage Page 0xFF02 (33-byte in/out report)
+        dongle_path = None
+        for d in all_devs:
+            if d.get('vendor_id') == AULA_WIRELESS_VID and d.get('product_id') == AULA_WIRELESS_PID:
+                if d.get('usage_page') == 0xFF02:
+                    dongle_path = d['path']
+                    break
+
+        if not dongle_path and not is_wired:
+            return False, None, False
+
+        if dongle_path:
+            path_str = dongle_path.decode('utf-8') if isinstance(dongle_path, bytes) else dongle_path
+            hDev = kernel32.CreateFileW(
+                path_str,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None
             )
+            if hDev != -1:
+                hW = kernel32.CreateEventW(None, True, False, None)
+                ovW = OVERLAPPED()
+                ovW.hEvent = hW
 
-            # 2. Query battery percentage via wireless receiver (Feature Report 6 on 0xFF04)
-            pct = None
-            found_wireless = False
-            charging_from_report = False
+                hR = kernel32.CreateEventW(None, True, False, None)
+                ovR = OVERLAPPED()
+                ovR.hEvent = hR
+                try:
+                    # Construct 33-byte query output packet
+                    # Command 0x30, Subcommand 1, Payload Length 0x1B (27)
+                    pkt = bytearray(33)
+                    pkt[0] = 0x00
+                    pkt[1] = 0x30
+                    pkt[2] = 0x00
+                    pkt[3] = 0x01
+                    pkt[4] = 0x1B
 
-            for d in all_devices:
-                if d.get('vendor_id') == WIRELESS_VID and d.get('usage_page') == 0xff04:
+                    buf_out = (ctypes.c_ubyte * 33).from_buffer_copy(pkt)
+                    written = wintypes.DWORD()
+                    kernel32.WriteFile(hDev, buf_out, 33, ctypes.byref(written), ctypes.byref(ovW))
+                    kernel32.WaitForSingleObject(hW, 200)
+
+                    buf_in = (ctypes.c_ubyte * 33)()
+                    read_bytes = wintypes.DWORD()
+                    kernel32.ReadFile(hDev, buf_in, 33, ctypes.byref(read_bytes), ctypes.byref(ovR))
+                    if kernel32.WaitForSingleObject(hR, 300) == 0:
+                        kernel32.GetOverlappedResult(hDev, ctypes.byref(ovR), ctypes.byref(read_bytes), False)
+                        resp = list(buf_in)
+                        status = resp[2]
+                        # resp[5:9] contains mouse model tag: 'M137' ([77, 49, 51, 55])
+                        # resp[13] is charging flag (1 = charging, 0 = discharging)
+                        # resp[14] is live exact battery percentage (0-100% at 1% precision)
+                        if status == 0 and resp[5:9] == [77, 49, 51, 55]:
+                            charging = bool(resp[13]) or is_wired
+                            pct = resp[14]
+                            if 0 <= pct <= 100:
+                                return True, pct, charging
+                        elif status == 2:
+                            # Mouse is paired but in low-power RF sleep mode
+                            return True, None, is_wired
+                    else:
+                        kernel32.CancelIo(hDev)
+                finally:
+                    kernel32.CloseHandle(hW)
+                    kernel32.CloseHandle(hR)
+                    kernel32.CloseHandle(hDev)
+
+        if is_wired:
+            return True, None, True
+
+        return False, None, False
+
+    def _query_compx_fallback(self):
+        """Secondary fallback for CompX generic dongle (VID 0x3554, PID 0xFA09)"""
+        try:
+            for d in hid.enumerate(COMPX_WIRELESS_VID, COMPX_WIRELESS_PID):
+                if d.get('usage_page') == 0xFF04:
                     path = d['path'].decode('utf-8') if isinstance(d['path'], bytes) else d['path']
                     hDev = kernel32.CreateFileW(
                         path,
@@ -209,23 +394,37 @@ class MouseBatteryMonitor:
                         if success:
                             data = list(buf)
                             if 0 <= data[3] <= 100:
-                                pct = data[3]
-                                found_wireless = True
-                                if data[1] == 1 or data[2] == 1:
-                                    charging_from_report = True
+                                charging = (data[1] == 1 or data[2] == 1)
+                                return True, data[3], charging
                     break
+        except Exception:
+            pass
+        return False, None, False
 
-            is_connected = found_wireless or is_wired
-            if not is_connected:
-                return False, None, False
+    def read_battery_hid(self):
+        """
+        Multi-tiered battery reader:
+        Tier 1: Direct OEM hardware query on 0x089D:0x062F (Usage Page 0xFF02)
+        Tier 2: CBMouse.exe memory sync (if official app is open)
+        Tier 3: CompX fallback (0x3554:0xFA09)
+        """
+        try:
+            # 1. Direct hardware query on primary AULA SC580X receiver
+            connected, new_pct, charging = self._query_sc580x_hid()
+            if connected:
+                return connected, new_pct, charging
 
-            # If wired cable is connected, percentage is 100% (or current read) and charging is TRUE
-            if is_wired:
-                if pct is None:
-                    pct = self.battery_pct if self.battery_pct else 100
-                return True, pct, True
+            # 2. Check CBMouse memory if running
+            cb_ok, cb_pct, cb_charging = self._read_cbmouse_memory()
+            if cb_ok:
+                return True, cb_pct, cb_charging
 
-            return True, pct, charging_from_report
+            # 3. Secondary fallback
+            fallback_ok, fb_pct, fb_charging = self._query_compx_fallback()
+            if fallback_ok:
+                return True, fb_pct, fb_charging
+
+            return False, None, False
 
         except Exception:
             return False, None, False
@@ -254,7 +453,7 @@ class MouseBatteryMonitor:
         - Maximized full-tile height (13-14 physical pixels tall), completely un-squished
         - No cluttering bottom underline bar (clean, open typography matching taskbar clock)
         - Pure solid 100% white (#FFFFFF) numbers with pristine Lanczos subpixel sharpness
-        - Sleek lightning bolt badge when Type-C wired charging
+        - Active Windows blue (#38AFFF) typography when Type-C wired charging
         """
         scale = 4
         buf_size = self.tray_size * scale
@@ -280,7 +479,7 @@ class MouseBatteryMonitor:
         text = "?" if not connected else str(percentage)
 
         # Determine text color:
-        # - Charging / Type-C Wired: Active vibrant Windows blue (matches active mic indicator)
+        # - Charging / Type-C Wired: Active vibrant Windows blue (#38AFFF)
         # - Disconnected: Muted / soft grey
         # - Normal Battery: 100% Solid pure white
         if not connected:
@@ -371,21 +570,23 @@ class MouseBatteryMonitor:
 
     def poll_loop(self):
         while self.running:
-            success, pct, charging = self.read_battery_hid()
+            success, new_pct, charging = self.read_battery_hid()
             if success:
                 self.is_connected = True
-                self.battery_pct = pct
+                if new_pct is not None:
+                    self.battery_pct = new_pct
+                    self._save_cache()
                 self.is_charging = charging
 
                 if self.is_charging:
                     self.low_battery_warned = False
-                elif pct <= 20 and not self.low_battery_warned:
+                elif self.battery_pct <= 20 and not self.low_battery_warned:
                     self.send_notification(
                         "AULA SC580X Low Battery",
-                        f"Mouse battery is low ({pct}%). Please connect the Type-C cable to recharge!"
+                        f"Mouse battery is low ({self.battery_pct}%). Please connect the Type-C cable to recharge!"
                     )
                     self.low_battery_warned = True
-                elif pct > 30:
+                elif self.battery_pct > 30:
                     self.low_battery_warned = False
             else:
                 self.is_connected = False
@@ -395,10 +596,12 @@ class MouseBatteryMonitor:
             time.sleep(self.poll_interval)
 
     def manual_refresh(self, icon, item):
-        success, pct, charging = self.read_battery_hid()
+        success, new_pct, charging = self.read_battery_hid()
         if success:
             self.is_connected = True
-            self.battery_pct = pct
+            if new_pct is not None:
+                self.battery_pct = new_pct
+                self._save_cache()
             self.is_charging = charging
         else:
             self.is_connected = False
@@ -418,10 +621,12 @@ class MouseBatteryMonitor:
 
     def run(self):
         # Initial read
-        success, pct, charging = self.read_battery_hid()
+        success, new_pct, charging = self.read_battery_hid()
         if success:
             self.is_connected = True
-            self.battery_pct = pct
+            if new_pct is not None:
+                self.battery_pct = new_pct
+                self._save_cache()
             self.is_charging = charging
 
         init_icon = self.generate_crisp_icon(self.battery_pct, self.is_connected, self.is_charging)
@@ -445,7 +650,7 @@ class MouseBatteryMonitor:
             status_desc += " ⚡ (Charging)"
         self.send_notification(
             "AULA SC580X Monitor",
-            f"Battery: {status_desc} • Active in System Tray\n(If hidden, click '^' near clock & drag icon to taskbar)"
+            f"Battery: {status_desc} • Active in System Tray\n(Exact 1% granularity synced)"
         )
 
         # Start background polling thread

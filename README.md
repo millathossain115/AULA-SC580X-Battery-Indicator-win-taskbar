@@ -75,29 +75,35 @@ Quick actions available directly from the system tray:
 ## 🔬 How It Works (Technical Breakdown)
 
 ### 1. Chipset Architecture & Dual Hardware Topology
-The **AULA SC580X** operates via dual hardware identities depending on the connection mode:
-- **Wireless 2.4GHz Mode:**
-  - **Receiver VID:** `0x3554` (CompX microcontroller)
-  - **Receiver PID:** `0xFA09` (2.4G Wireless Receiver)
-  - **HID Usage Page:** `0xFF04` (Vendor command channel)
-- **Wired Type-C Mode:**
+The **AULA SC580X** operates via direct OEM hardware channels depending on connection mode:
+- **Primary Wireless 2.4GHz Mode:**
+  - **Receiver VID:** `0x089D` (Official AULA OEM Wireless Receiver)
+  - **Receiver PID:** `0x062F`
+  - **HID Usage Page:** `0xFF02` (Usage `0x00`, 33-byte Input/Output Report channel)
+  - **Model Identifier:** `M137` (ASCII `[77, 49, 51, 55]`)
+- **Primary Wired Type-C Mode:**
   - **Wired Device VID:** `0x088D` (USB Gaming Mouse)
   - **Wired Device PID:** `0x062E`
-  - Instantly detected upon plugging in Type-C cable, activating the charging badge (`⚡`).
+  - Instantly detected upon plugging in Type-C cable, activating the charging state.
+- **Secondary / Generic Fallback:**
+  - **Receiver VID:** `0x3554`, **PID:** `0xFA09` (CompX microcontroller fallback on Usage Page `0xFF04`).
 
-### 2. Direct Win32 HID Feature Querying
-The monitor queries the hardware directly using Windows user-mode HID APIs without installing proprietary drivers:
+### 2. Direct Win32 HID Communication (Exact 1% Precision)
+Rather than coarse 10% approximations or static dummy values, the monitor communicates directly with the receiver using 33-byte Win32 Overlapped I/O packets:
 ```mermaid
 sequenceDiagram
     participant App as AULA Battery Tray
     participant Win32 as Windows HID Subsystem
-    participant Mouse as AULA SC580X (CompX)
+    participant Mouse as AULA SC580X Receiver
 
-    App->>Win32: Open handle (CreateFileW) on Usage Page 0xFF04
-    App->>Mouse: Request Feature Report ID 6 (HidD_GetFeature)
-    Mouse-->>App: 8-byte payload: [0x06, Flags, Mode, Pct, ...]
-    Note over App: Parse Pct (data[3]) & Charging status (data[1], data[2], wired PID)
+    App->>Win32: Open overlapped handle (CreateFileW) on UP 0xFF02
+    App->>Mouse: Send 33-byte Query Report (Cmd 0x30, Subcmd 0x01)
+    Mouse-->>App: 33-byte Input Report: [0x00, 0x30, Status, ..., 'M','1','3','7', ...]
+    Note over App: Parse Status (0=Online, 2=RF Sleep), Charging (Byte 13), Exact Battery % (Byte 14)
     App->>App: Render native DPI-aware icon with Win32 1:1 LoadImage mapping
+```
+- **Live State (Status 0):** Updates the tray icon with the exact live battery percentage at 1% precision (e.g. 74%, 73%, 72%...).
+- **RF Sleep Retention (Status 2):** When the mouse enters power-saving sleep during inactivity, the monitor preserves the last known battery level from local cache rather than falling back to dummy percentages.
     App->>Win32: Update System Tray Icon & Tooltip
 ```
 
